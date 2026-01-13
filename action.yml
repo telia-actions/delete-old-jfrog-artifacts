@@ -1,0 +1,84 @@
+name: 'Delete old artifacts from JFrog repository'
+description: 'Deletes old artifacts from given repository in JFrog. Uses Powershell.'
+inputs:
+  jfrog-repo-name:
+    description: 'Name of JFrog repository to delete old artifacts from'
+    required: true
+  jfrog-username:
+    description: 'JFrog username to use for deleting old artifacts. Should have WRITE permissions.'
+    required: true
+  jfrog-password:
+    description: 'JFrog user password'
+    required: false
+  artifact-prefix-to-search:
+    description: 'Prefix of the artifacts to check'
+    required: true
+    default: 'Telia'
+  limit-of-months:
+    description: 'Limit of months how old should be the artifact to be deleted'
+    required: true
+    default: 6
+  minimum-number-of-artifacts-to-leave:
+    description: 'Minimum number of artifacts to leave even if they are old. This is a precautionary parameter to prevent deleting latest old artifacts as they might be the ones currently deployed.'
+    required: true
+    default: 100
+runs:
+  using: "composite"
+  steps:
+    - name: Delete artifacts
+      shell: powershell
+      run: |
+        
+        function WriteLog {
+            param (
+                $Text
+            )
+            
+            Write-Host "$(Get-Date -Format o): " -NoNewline -BackgroundColor DarkMagenta -ForegroundColor Yellow
+            Write-Host $Text -BackgroundColor DarkMagenta -ForegroundColor Gray
+          }
+          
+          $authHeaderValue = "Basic " + [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes("${{ inputs.jfrog-username }}:${{ inputs.jfrog-password }}"))
+          
+          WriteLog("Searching for artifacts")
+          
+          $response = Invoke-WebRequest `
+            -Method Get `
+            -Uri "https://jfrog.teliacompany.io/artifactory/api/search/artifact?name=${{ inputs.artifact-prefix-to-search }}*&repos=${{ inputs.jfrog-repo-name }}" `
+            -Headers @{ "Authorization" = $authHeaderValue; "X-Result-Detail" = "info" } `
+            -UseBasicParsing
+          
+          $results = (ConvertFrom-Json -InputObject ([System.Text.Encoding]::UTF8.GetString($response.Content))).results
+          $sortedResults = $results | Sort-Object lastModified
+          
+          $limit = ${{ inputs.minimum-number-of-artifacts-to-leave }}
+          
+          #not doing anything if there are less than given minimum number of artifacts in artifactory
+          if ($sortedResults.count -gt $limit)
+          {
+            WriteLog("$($sortedResults.count) artifacts found in the repository, starting cleaning artifacts older than ${{ inputs.limit-of-months }} months.")
+            $date = (Get-Date).AddMonths(-${{ inputs.limit-of-months }}) #deleting artifacts older than given number of months months
+            $deletedCount = 0
+            
+            foreach($artifact in $sortedResults)
+            {
+              if ((Get-Date $artifact.lastModified) -lt $date -and (($sortedResults.count - $deletedCount) -gt $limit))
+              {
+                WriteLog("Deleting artifact '$($artifact.path)'")
+                
+                Invoke-WebRequest `
+                  -Method Delete `
+                  -Uri "$($artifact.downloadUri)" `
+                  -Headers @{ "Authorization" = $authHeaderValue } `
+                  -UseBasicParsing
+                  
+                  $deletedCount = $deletedCount + 1
+              }
+            }
+            
+            WriteLog("Cleaning finished: deleted $deletedCount artifacts");
+          }
+          else
+          {
+            WriteLog("Only $($sortedResults.count) artifacts found in the repository, which is less than given minimum of ${{ inputs.minimum-number-of-artifacts-to-leave }}, aborting cleaning")
+          }
